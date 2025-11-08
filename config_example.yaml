@@ -1,0 +1,23 @@
+ble_device:
+  name_filter: ["testo", "t405", "405i"]
+  address: ""                # можно оставить пустым — найдёт по имени
+
+mqtt:
+  enabled: true
+  host: "mqtt.server.com"
+  port: 8883
+  topic: "sensors/testo405i"
+  username: "user"
+  password: "pass123"
+  qos: 1
+  retain: false
+  tls_enabled: true
+  ca_cert: "/etc/ssl/certs/ca-certificates.crt"
+  client_cert: ""
+  client_key: ""
+
+logging:
+  console_output: true
+  sample_interval: 5.0
+  csv_logging: true
+  csv_file: "testo405i_data.csv"
