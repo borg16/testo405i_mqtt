@@ -14,7 +14,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 import paho.mqtt.client as mqtt
 
-# ---------------- Логирование ----------------
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -25,24 +25,78 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Testo405i")
 
-# ---------------- Константы BLE ----------------
+# ---------------- BLE Constants ----------------
 UUID_WRITE = "0000fff1-0000-1000-8000-00805f9b34fb"
 UUID_NOTIFY = "0000fff2-0000-1000-8000-00805f9b34fb"
-UUID_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"  # Serial Number String (но у Testo часто "Serial Number" как текст)
+UUID_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"  # Serial Number String (Testo often uses the literal text "Serial Number")
 
 INIT_COMMANDS = [
     "5600030000000c69023e81",
     "200000000000077b",
+    #    ASCII suffix: "Firmware"
     "04001500000005930f0000004669726d77617265",
+    #    ASCII: "Version0O"  (readable fragment: "Version")
     "56657273696f6e304f",
     "04001500000005930f0000004669726d77617265",
     "56657273696f6e304f",
+    #    ASCII suffix: "Measurem" (start of "Measurement")
     "04001600000005d7100000004d6561737572656d",
+    #    ASCII: "entCycleaa"  (continuation: "entCycle" -> likely completes "MeasurementCycle")
     "656e744379636c656161",
     "110000000000035a",
 ]
 
-# ---------------- Вспомогательные функции ----------------
+
+
+# ---------------- Helper functions ----------------
+def calc_crc16_modbus(data: bytes) -> int:
+    """
+    Calculate CRC-16/MODBUS for the given bytes.
+    Uses polynomial 0x8005 with initial value 0xFFFF.
+    Returns 16-bit CRC value.
+
+    Args:
+        data: Bytes to calculate CRC for
+
+    Returns:
+        int: 16-bit CRC value
+
+    Example:
+        >>> hex(calc_crc16_modbus(b'123456789'))
+        '0x4b37'
+    """
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001  # 0xA001 is reversed 0x8005
+            else:
+                crc >>= 1
+    # Return CRC in correct byte order
+    return crc
+
+
+def append_crc16_modbus(message: bytes) -> bytes:
+    """
+    Append CRC-16/MODBUS to a message in little-endian byte order.
+    
+    Args:
+        message: The message bytes to append CRC to
+
+    Returns:
+        bytes: Original message with 2-byte CRC appended
+
+    Example:
+        >>> message = append_crc16_modbus(b'123456789')
+        >>> message.hex()
+        '313233343536373839374b'  # '123456789' + CRC(0x4b37) in LE
+    """
+    crc = calc_crc16_modbus(message)
+    # Append CRC in little-endian order (low byte first)
+    return message + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
 def mqtt_server_reachable(host, port=1883, timeout=2.0):
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -52,7 +106,7 @@ def mqtt_server_reachable(host, port=1883, timeout=2.0):
 
 
 def extract_serial_from_text(text: str) -> str | None:
-    """Пытаемся достать серийный номер из имени вида 'T405i SN:45866787' или похожих."""
+    """Try to extract a serial number from names like 'T405i SN:45866787' or similar."""
     if not text:
         return None
     m = re.search(r'(\d{5,})', text)
@@ -63,24 +117,24 @@ def extract_serial_from_text(text: str) -> str | None:
 
 def normalize_serial(candidate: str | None, fallback: str | None = None) -> str | None:
     """
-    Приводим серийный номер к нормальному виду.
-    Отбрасываем пустые значения, 'Serial Number' и т.п.
+    Normalize a serial number candidate.
+    Discard empty values and placeholders like 'Serial Number'.
     """
     cand = (candidate or "").strip()
     if cand and cand.lower() != "serial number":
-        # если в строке есть цифры — берём только их
+    # if the string contains digits — take only them
         digits = "".join(ch for ch in cand if ch.isdigit())
         return digits or cand
-    # если основной кандидат не годится — пробуем fallback
+    # if the primary candidate is not suitable — try the fallback
     if fallback:
         return normalize_serial(fallback, None)
     return None
 
 # ---------------- MQTT ----------------
 def mqtt_connect(cfg):
-    """Подключение к MQTT (с опцией TLS)."""
+    """Connect to MQTT broker (supports optional TLS)."""
     if not cfg.get("enabled", False):
-        logger.info("MQTT отключён в конфигурации.")
+        logger.info("MQTT disabled in configuration.")
         return None
 
     host = cfg.get("host")
@@ -88,7 +142,7 @@ def mqtt_connect(cfg):
     tls_enabled = cfg.get("tls_enabled", False)
 
     if not mqtt_server_reachable(host, port):
-        logger.warning(f"MQTT сервер {host}:{port} недоступен. Работа без MQTT.")
+        logger.warning(f"MQTT server {host}:{port} unreachable. Continuing without MQTT.")
         return None
 
     try:
@@ -111,16 +165,16 @@ def mqtt_connect(cfg):
 
         client.connect(host, port, 60)
         client.loop_start()
-        logger.info(f"Успешно подключено к MQTT брокеру {host}:{port}{' (TLS)' if tls_enabled else ''}.")
+        logger.info(f"Connected to MQTT broker {host}:{port}{' (TLS)' if tls_enabled else ''}.")
         return client
 
     except Exception as e:
-        logger.error(f"Ошибка подключения к MQTT: {e}")
+        logger.error(f"MQTT connection error: {e}")
         return None
 
 
 def mqtt_publish(client, cfg, data, serial_number: str | None = None):
-    """Публикация данных в MQTT в JSON, с топиком sensors/testo405i/<serial>."""
+    """Publish data to MQTT as JSON under topic sensors/testo405i/<serial>."""
     if not client:
         return
     base_topic = cfg.get("topic", "sensors/testo405i").rstrip("/")
@@ -138,17 +192,17 @@ def mqtt_publish(client, cfg, data, serial_number: str | None = None):
             retain=cfg.get("retain", False),
         )
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.warning(f"Ошибка публикации MQTT (rc={result.rc}) в топик {topic}")
+            logger.warning(f"MQTT publish error (rc={result.rc}) to topic {topic}")
         else:
-            logger.debug(f"Публикация MQTT → {topic}: {payload}")
+            logger.debug(f"MQTT publish → {topic}: {payload}")
     except Exception as e:
-        logger.error(f"Ошибка при публикации в MQTT: {e}")
+        logger.error(f"Error publishing to MQTT: {e}")
 
 # ---------------- CSV ----------------
 class CSVLogger:
     def __init__(self, path: str):
         self.path = path
-        # Создаём файл с заголовком, если его ещё нет
+        # Create the file with a header if it doesn't exist yet
         if not os.path.exists(path):
             with open(path, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -173,7 +227,7 @@ class TestoReader:
         self.accum = b""
 
     def handle_notify(self, sender, data: bytearray):
-        """Приём и парсинг BLE пакетов Testo 405i."""
+        """Receive and parse Testo 405i BLE packets."""
         try:
             self.accum += data
             text = self.accum.decode(errors="ignore")
@@ -186,15 +240,15 @@ class TestoReader:
                 self._process("Velocity")
                 return
 
-            # если накопили слишком много мусора — сбросим
+            # if we've accumulated too much junk, reset the buffer
             if len(self.accum) > 64:
                 self.accum = b""
 
         except Exception as e:
-            logger.error(f"Ошибка handle_notify: {e}")
+            logger.error(f"handle_notify error: {e}")
 
     def _process(self, kind: str):
-        """После слова Temperature/Velocity читаем следующие 8 байт и обновляем буфер."""
+        """After the word 'Temperature' or 'Velocity', read the following bytes and update the buffer."""
         try:
             word_bytes = kind.encode()
             idx = self.accum.find(word_bytes)
@@ -204,25 +258,25 @@ class TestoReader:
 
             after = self.accum[idx + len(word_bytes):]
             if len(after) < 8:
-                # ждём следующий фрагмент
+                # wait for the next fragment
                 return
 
             value = struct.unpack("<f", after[0:4])[0]
             self.buffer[kind] = value
 
-            # очищаем накопитель после успешного парса
+            # clear the accumulator after successful parsing
             self.accum = b""
 
             self._maybe_report()
 
         except Exception as e:
-            logger.error(f"Ошибка _process({kind}): {e}")
+            logger.error(f"_process({kind}) error: {e}")
             self.accum = b""
 
     def _maybe_report(self):
         """
-        Публикуем только когда есть и Temperature, и Velocity.
-        И не чаще, чем раз в sample_interval секунд.
+        Publish only when both Temperature and Velocity are present.
+        Also respect the configured sample_interval to avoid publishing too often.
         """
         if self.buffer["Temperature"] is None or self.buffer["Velocity"] is None:
             return
@@ -236,7 +290,7 @@ class TestoReader:
         temp = self.buffer["Temperature"]
         vel = self.buffer["Velocity"]
 
-        logger.info(f"Измерения: Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
+        logger.info(f"Measurements: Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
 
         if self.mqtt:
             mqtt_publish(self.mqtt, self.cfg["mqtt"], self.buffer, self.serial_number)
@@ -244,7 +298,7 @@ class TestoReader:
         if self.csv_logger:
             self.csv_logger.append(temp, vel)
 
-# ---------------- Основная логика ----------------
+# ---------------- Main logic ----------------
 async def connect_and_run(cfg):
     ble_cfg = cfg.get("ble_device", {})
     name_filter = [n.lower() for n in ble_cfg.get("name_filter", [])]
@@ -253,8 +307,8 @@ async def connect_and_run(cfg):
     device_name = None
 
     if addr:
-        logger.info(f"Используется указанный адрес из конфигурации: {addr}")
-        # Попробуем одним коротким сканом найти имя по MAC (чтобы вытащить SN из имени)
+        logger.info(f"Using configured address: {addr}")
+        # Try a short scan to find the device name by MAC (to extract SN from the name)
         try:
             devices = await BleakScanner.discover(timeout=3.0)
             for d in devices:
@@ -262,50 +316,50 @@ async def connect_and_run(cfg):
                     device_name = d.name
                     break
             if device_name:
-                logger.info(f"По MAC найдено устройство: {device_name}")
+                logger.info(f"Device found by MAC: {device_name}")
         except Exception as e:
-            logger.warning(f"Не удалось выполнить предварительный скан для MAC {addr}: {e}")
+            logger.warning(f"Pre-scan for MAC {addr} failed: {e}")
     else:
-        logger.info("Поиск BLE устройств (5 секунд)...")
+        logger.info("Scanning for BLE devices (5 seconds)...")
         devices = await BleakScanner.discover(timeout=5.0, return_adv=True)
         target = None
         for dev, adv in devices.values():
             n = (dev.name or "").lower()
-            logger.debug(f"Обнаружено устройство: {dev.address} | {dev.name or '<no name>'} | RSSI {adv.rssi}")
+            logger.debug(f"Discovered device: {dev.address} | {dev.name or '<no name>'} | RSSI {adv.rssi}")
             if any(k in n for k in name_filter):
                 target = dev
             elif not dev.name and adv.manufacturer_data:
-                # Heuristic: Testo manufacturer IDs; при необходимости можно уточнить
+                # Heuristic: Testo manufacturer IDs; can be refined if needed
                 if any(mid in (0x92, 0x0d) for mid in adv.manufacturer_data.keys()):
                     target = dev
 
         if not target:
-            raise RuntimeError("Устройство Testo 405i не найдено (укажите MAC в config.yaml).")
+            raise RuntimeError("Testo 405i device not found (specify MAC in config.yaml).")
 
         addr = target.address
         device_name = target.name
-        logger.info(f"Успешно найден зонд: {device_name or addr}")
+    logger.info(f"Probe found: {device_name or addr}")
 
     mqtt_client = mqtt_connect(cfg.get("mqtt", {}))
 
     csv_logger = None
     log_cfg = cfg.get("logging", {})
+    csv_path = log_cfg.get("csv_file", "testo405i_data.csv")
     if log_cfg.get("csv_logging", False):
-        csv_path = log_cfg.get("csv_file", "testo405i_data.csv")
         csv_logger = CSVLogger(csv_path)
-        logger.info(f"CSV логирование включено: {csv_path}")
+    logger.info(f"CSV logging enabled: {csv_path}")
 
     stop_event = asyncio.Event()
 
     def handle_sigint():
-        logger.info("Остановка по запросу пользователя (Ctrl+C).")
+        logger.info("Stopping on user request (Ctrl+C).")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
     try:
         loop.add_signal_handler(2, handle_sigint)  # SIGINT
     except NotImplementedError:
-        # На Windows add_signal_handler не поддерживается — просто игнорируем
+        # On some platforms (like Windows) add_signal_handler isn't supported — ignore
         pass
 
     while not stop_event.is_set():
@@ -314,7 +368,7 @@ async def connect_and_run(cfg):
                 if not client.is_connected:
                     await client.connect()
 
-                # Пытаемся определить серийный номер
+                # Try to determine the serial number
                 serial_from_name = extract_serial_from_text(device_name)
                 serial_from_gatt = None
                 try:
@@ -325,37 +379,37 @@ async def connect_and_run(cfg):
 
                 serial_number = normalize_serial(serial_from_gatt, serial_from_name)
                 if serial_number:
-                    logger.info(f"Идентификатор устройства (серийный номер): {serial_number}")
+                    logger.info(f"Device identifier (serial number): {serial_number}")
                 else:
-                    logger.info("Серийный номер не определён. Публикация будет в базовый топик без суффикса.")
+                    logger.info("Serial number not determined. Publishing to base topic without suffix.")
 
-                logger.info(f"Успешно подключено к BLE устройству {addr}.")
+                logger.info(f"Successfully connected to BLE device {addr}.")
 
                 reader = TestoReader(cfg, mqtt_client, serial_number, csv_logger)
                 await client.start_notify(UUID_NOTIFY, reader.handle_notify)
 
-                # Отправляем инициализационные команды
+                # Send initialization commands
                 for h in INIT_COMMANDS:
                     await client.write_gatt_char(UUID_WRITE, bytes.fromhex(h), response=True)
                     await asyncio.sleep(0.4)
 
-                logger.info("Начат приём данных. Нажмите Ctrl+C для завершения.")
+                logger.info("Started receiving data. Press Ctrl+C to stop.")
 
                 while client.is_connected and not stop_event.is_set():
                     await asyncio.sleep(0.5)
 
         except BleakError as e:
-            logger.warning(f"Ошибка BLE: {e}. Повтор через 5 секунд.")
+            logger.warning(f"BLE error: {e}. Retrying in 5 seconds.")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
+            logger.error(f"Unexpected error: {e}")
             await asyncio.sleep(5)
 
     if mqtt_client:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
 
-    logger.info("Работа завершена.")
+    logger.info("Shutdown complete.")
 
 
 def main():
