@@ -131,12 +131,63 @@ def mqtt_connect(cfg):
         return None
 
 
+def publish_hass_config(client, cfg, serial_number: str):
+    """Publish Home Assistant MQTT discovery configuration."""
+    base = cfg.get("discovery_prefix", "homeassistant")
+    device_id = f"testo405i_{serial_number}" if serial_number else "testo405i"
+    device_name = f"Testo 405i {serial_number}" if serial_number else "Testo 405i"
+    
+    device_info = {
+        "identifiers": [device_id],
+        "name": device_name,
+        "manufacturer": "Testo",
+        "model": "405i",
+    }
+
+    sensors = [
+        {
+            "name": "Temperature",
+            "unique_id": f"{device_id}_temperature",
+            "device_class": "temperature",
+            "state_topic": f"testo405i/{device_id}/state",
+            "unit_of_measurement": "°C",
+            "value_template": "{{ value_json.Temperature }}",
+            "device": device_info
+        },
+        {
+            "name": "Velocity",
+            "unique_id": f"{device_id}_velocity",
+            "device_class": "speed",
+            "state_topic": f"testo405i/{device_id}/state",
+            "unit_of_measurement": "m/s",
+            "value_template": "{{ value_json.Velocity }}",
+            "device": device_info
+        }
+    ]
+
+    for sensor in sensors:
+        config_topic = f"{base}/sensor/{device_id}/{sensor['unique_id']}/config"
+        try:
+            result = client.publish(
+                config_topic,
+                json.dumps(sensor),
+                qos=1,
+                retain=True
+            )
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                logger.warning(f"Failed to publish HA discovery for {sensor['name']}")
+            else:
+                logger.debug(f"Published HA discovery for {sensor['name']}")
+        except Exception as e:
+            logger.error(f"Error publishing HA discovery: {e}")
+
 def mqtt_publish(client, cfg, data, serial_number: str | None = None):
-    """Publish data to MQTT as JSON under topic sensors/testo405i/<serial>."""
+    """Publish data to MQTT in Home Assistant compatible format."""
     if not client:
         return
-    base_topic = cfg.get("topic", "sensors/testo405i").rstrip("/")
-    topic = f"{base_topic}/{serial_number}" if serial_number else base_topic
+
+    device_id = f"testo405i_{serial_number}" if serial_number else "testo405i"
+    state_topic = f"testo405i/{device_id}/state"
 
     payload = json.dumps(
         {k: round(v, 3) for k, v in data.items() if v is not None},
@@ -144,15 +195,15 @@ def mqtt_publish(client, cfg, data, serial_number: str | None = None):
     )
     try:
         result = client.publish(
-            topic,
+            state_topic,
             payload,
             qos=cfg.get("qos", 0),
             retain=cfg.get("retain", False),
         )
         if result.rc != mqtt.MQTT_ERR_SUCCESS:
-            logger.warning(f"MQTT publish error (rc={result.rc}) to topic {topic}")
+            logger.warning(f"MQTT publish error (rc={result.rc}) to topic {state_topic}")
         else:
-            logger.debug(f"MQTT publish → {topic}: {payload}")
+            logger.debug(f"MQTT publish → {state_topic}: {payload}")
     except Exception as e:
         logger.error(f"Error publishing to MQTT: {e}")
 
@@ -222,38 +273,16 @@ class TestoReader:
                
             if data.startswith(b'\x10\x80'):  # command response
                 firstDataByte = 4+payload[0];
-                logger.info(f"Name: {(payload[4:firstDataByte]).decode('utf-8')}")
+                name = (payload[4:firstDataByte]).decode('utf-8')
+                # logger.info(f"Name: {name}")
                 value = struct.unpack("<f",payload[firstDataByte:firstDataByte+4])[0]
-                logger.info(f"Value: {value}")
+                # logger.info(f"Value: {value}")
+                self.buffer[name] = value
+                self._maybe_report()
 
         except Exception as e:
             logger.error(f"handle_notify error: {e}")
 
-    def _process(self, kind: str):
-        """After the word 'Temperature' or 'Velocity', read the following bytes and update the buffer."""
-        try:
-            word_bytes = kind.encode()
-            idx = self.accum.find(word_bytes)
-            if idx == -1:
-                self.accum = b""
-                return
-
-            after = self.accum[idx + len(word_bytes):]
-            if len(after) < 8:
-                # wait for the next fragment
-                return
-
-            value = struct.unpack("<f", after[0:4])[0]
-            self.buffer[kind] = value
-
-            # clear the accumulator after successful parsing
-            self.accum = b""
-
-            self._maybe_report()
-
-        except Exception as e:
-            logger.error(f"_process({kind}) error: {e}")
-            self.accum = b""
 
     def _maybe_report(self):
         """
@@ -272,7 +301,7 @@ class TestoReader:
         temp = self.buffer["Temperature"]
         vel = self.buffer["Velocity"]
 
-        logger.info(f"Measurements: Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
+        logger.debug(f"Measurements: Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
 
         if self.mqtt:
             mqtt_publish(self.mqtt, self.cfg["mqtt"], self.buffer, self.serial_number)
@@ -366,6 +395,10 @@ async def connect_and_run(cfg):
                     logger.info("Serial number not determined. Publishing to base topic without suffix.")
 
                 logger.info(f"Successfully connected to BLE device {addr}.")
+                
+                # Publish Home Assistant MQTT discovery configuration if MQTT is enabled
+                if mqtt_client:
+                    publish_hass_config(mqtt_client, cfg.get("mqtt", {}), serial_number)
 
                 reader = TestoReader(cfg, mqtt_client, serial_number, csv_logger)
                 await client.start_notify(UUID_NOTIFY, reader.handle_notify)
