@@ -26,75 +26,33 @@ logging.basicConfig(
 logger = logging.getLogger("Testo405i")
 
 # ---------------- BLE Constants ----------------
-UUID_WRITE = "0000fff1-0000-1000-8000-00805f9b34fb"
+UUID_WRITE  = "0000fff1-0000-1000-8000-00805f9b34fb"
 UUID_NOTIFY = "0000fff2-0000-1000-8000-00805f9b34fb"
 UUID_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"  # Serial Number String (Testo often uses the literal text "Serial Number")
 
 INIT_COMMANDS = [
-    "5600030000000c69023e81",
-    "200000000000077b",
-    #    ASCII suffix: "Firmware"
-    "04001500000005930f0000004669726d77617265",
-    #    ASCII: "Version0O"  (readable fragment: "Version")
-    "56657273696f6e304f",
-    "04001500000005930f0000004669726d77617265",
-    "56657273696f6e304f",
-    #    ASCII suffix: "Measurem" (start of "Measurement")
-    "04001600000005d7100000004d6561737572656d",
-    #    ASCII: "entCycleaa"  (continuation: "entCycle" -> likely completes "MeasurementCycle")
-    "656e744379636c656161",
-    "110000000000035a",
+    [b"\x56\x00\x03\x00\x00\x00", b"\x02"],
+    [b"\x20\x00\x00\x00\x00\x00"],
+    [b"\x04\x00\x15\x00\x00\x00", b"\x0f\x00\x00\x00FirmwareVersion"],
+    [b"\x04\x00\x16\x00\x00\x00", b"\x10\x00\x00\x00MeasurementCycle"],
+    [b"\x11\x00\x00\x00\x00\x00"],
 ]
 
-
-
-# ---------------- Helper functions ----------------
 def calc_crc16_modbus(data: bytes) -> int:
     """
     Calculate CRC-16/MODBUS for the given bytes.
-    Uses polynomial 0x8005 with initial value 0xFFFF.
-    Returns 16-bit CRC value.
-
-    Args:
-        data: Bytes to calculate CRC for
-
-    Returns:
-        int: 16-bit CRC value
-
-    Example:
-        >>> hex(calc_crc16_modbus(b'123456789'))
-        '0x4b37'
+    Polynomial: 0x8005 (reversed 0xA001), initial value 0xFFFF.
+    Returns 16-bit CRC as integer.
     """
     crc = 0xFFFF
     for byte in data:
         crc ^= byte
         for _ in range(8):
             if crc & 0x0001:
-                crc = (crc >> 1) ^ 0xA001  # 0xA001 is reversed 0x8005
+                crc = (crc >> 1) ^ 0xA001
             else:
                 crc >>= 1
-    # Return CRC in correct byte order
     return crc
-
-
-def append_crc16_modbus(message: bytes) -> bytes:
-    """
-    Append CRC-16/MODBUS to a message in little-endian byte order.
-    
-    Args:
-        message: The message bytes to append CRC to
-
-    Returns:
-        bytes: Original message with 2-byte CRC appended
-
-    Example:
-        >>> message = append_crc16_modbus(b'123456789')
-        >>> message.hex()
-        '313233343536373839374b'  # '123456789' + CRC(0x4b37) in LE
-    """
-    crc = calc_crc16_modbus(message)
-    # Append CRC in little-endian order (low byte first)
-    return message + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 
 def mqtt_server_reachable(host, port=1883, timeout=2.0):
@@ -132,7 +90,7 @@ def normalize_serial(candidate: str | None, fallback: str | None = None) -> str 
 
 # ---------------- MQTT ----------------
 def mqtt_connect(cfg):
-    """Connect to MQTT broker (supports optional TLS)."""
+    """Connect to MQTT broker (supports optional TLS) and set up Home Assistant discovery."""
     if not cfg.get("enabled", False):
         logger.info("MQTT disabled in configuration.")
         return None
@@ -225,24 +183,48 @@ class TestoReader:
         self.buffer = {"Temperature": None, "Velocity": None}
         self.last_pub = 0.0
         self.accum = b""
+        self.latestAnswerFuture = asyncio.Future()
+        self.incompleteAnswer = b""
+
+    async def latestAnswer(self):
+        result = await asyncio.wait_for(self.latestAnswerFuture, timeout=0.4)
+        self.latestAnswerFuture = asyncio.Future()
+        return result
 
     def handle_notify(self, sender, data: bytearray):
         """Receive and parse Testo 405i BLE packets."""
         try:
-            self.accum += data
-            text = self.accum.decode(errors="ignore")
-
-            if "Temperature" in text:
-                self._process("Temperature")
+            if self.incompleteAnswer:
+                data = self.incompleteAnswer + data
+                self.incompleteAnswer = b""
+            length = data[2]
+            if(length + 3 > len(data)):
+                self.incompleteAnswer = data
                 return
 
-            if "Velocity" in text:
-                self._process("Velocity")
-                return
+            crc = calc_crc16_modbus(data[:8])
+            if crc != 0:
+                logger.warning(f"CRC mismatch in received data. {hex(data[6+length]+(data[7+length]<<8))} {hex(crc)}")
 
-            # if we've accumulated too much junk, reset the buffer
-            if len(self.accum) > 64:
-                self.accum = b""
+            payload = data[8:8+length]
+            if data.startswith(b'\x07\x00'):
+                if length > 0:
+                    if not self.latestAnswerFuture.done():
+                        self.latestAnswerFuture.set_result(f"Command response payload: {payload[:length-2]}")
+                else:
+                    if not self.latestAnswerFuture.done():
+                        self.latestAnswerFuture.set_result(f"Command acknowledged.")
+                    return
+
+            crc = calc_crc16_modbus(payload)
+            if(crc != 0):
+                logger.warning("CRC mismatch in payload.")
+               
+            if data.startswith(b'\x10\x80'):  # command response
+                firstDataByte = 4+payload[0];
+                logger.info(f"Name: {(payload[4:firstDataByte]).decode('utf-8')}")
+                value = struct.unpack("<f",payload[firstDataByte:firstDataByte+4])[0]
+                logger.info(f"Value: {value}")
 
         except Exception as e:
             logger.error(f"handle_notify error: {e}")
@@ -390,8 +372,11 @@ async def connect_and_run(cfg):
 
                 # Send initialization commands
                 for h in INIT_COMMANDS:
-                    await client.write_gatt_char(UUID_WRITE, bytes.fromhex(h), response=True)
-                    await asyncio.sleep(0.4)
+                    logger.info(f"Sending init command: {b''.join(h)}")
+                    for subcommand in h:
+                        await sendcommand(client, subcommand)
+                    answer = await reader.latestAnswer()
+                    logger.info(f"Init command response: {answer}")
 
                 logger.info("Started receiving data. Press Ctrl+C to stop.")
 
@@ -411,6 +396,26 @@ async def connect_and_run(cfg):
 
     logger.info("Shutdown complete.")
 
+async def sendcommand(client: BleakClient, h: bytes):
+    max_chunk = 18
+    crc = calc_crc16_modbus(h)
+    crc_bytes = bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+    if len(h) <= max_chunk:
+        command = h + crc_bytes
+        logger.debug(f"Sending init command: {command}")
+        await client.write_gatt_char(UUID_WRITE, command, response=True)
+    else:
+        # send in multiple chunks, append CRC only to the last chunk
+        chunks = [h[i:i+max_chunk] for i in range(0, len(h), max_chunk)]
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            if i == total - 1:
+                to_send = chunk + crc_bytes
+            else:
+                to_send = chunk
+            logger.debug(f"Sending init command chunk {i+1}/{total}: {to_send}")
+            await client.write_gatt_char(UUID_WRITE, to_send, response=True)
 
 def main():
     with open("config.yaml", "r") as f:
