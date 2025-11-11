@@ -1,23 +1,41 @@
 ble_device:
-  name_filter: ["testo", "t405", "405i"]
-  address: ""                # можно оставить пустым — найдёт по имени
+  # Optional: Specify MAC address to connect directly
+  # address: "A4:06:E9:8E:3D:D9"
+  
+  # Optional: Specify BLE adapter (default: hci1)
+  # adapter: "hci0"  # or "hci1", "hci2", etc.
+  
+  # Device name filter for auto-discovery (case insensitive)
+  name_filter:
+    - "405i"
+    - "testo"
 
 mqtt:
   enabled: true
-  host: "mqtt.server.com"
-  port: 8883
-  topic: "sensors/testo405i"
-  username: "user"
-  password: "pass123"
-  qos: 1
+  host: "homeassistant.local"  # Your MQTT broker address
+  port: 1883
+  username: "mqtt_user"        # Optional
+  password: "mqtt_password"    # Optional
+  
+  # Home Assistant MQTT Discovery
+  discovery_prefix: "homeassistant"  # Default Home Assistant discovery prefix
+  
+  # Optional: TLS configuration
+  tls_enabled: false
+  # ca_cert: "ca.crt"
+  # client_cert: "client.crt"
+  # client_key: "client.key"
+  
+  # MQTT Quality of Service level (0, 1, or 2)
+  qos: 0
+  
+  # Whether to retain the last message
   retain: false
-  tls_enabled: true
-  ca_cert: "/etc/ssl/certs/ca-certificates.crt"
-  client_cert: ""
-  client_key: ""
 
 logging:
-  console_output: true
-  sample_interval: 5.0
+  # Enable CSV logging
   csv_logging: true
   csv_file: "testo405i_data.csv"
+  
+  # Measurement sample interval in seconds
+  sample_interval: 5.0
