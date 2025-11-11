@@ -230,8 +230,9 @@ class TestoReader:
         self.mqtt = mqtt_client
         self.serial_number = serial_number
         self.csv_logger = csv_logger
-
-        self.buffer = {"Temperature": None, "Velocity": None}
+        # Accumulate sums and counts so we can publish averages since last publish
+        self.sums = {"Temperature": 0.0, "Velocity": 0.0}
+        self.counts = {"Temperature": 0, "Velocity": 0}
         self.last_pub = 0.0
         self.accum = b""
         self.latestAnswerFuture = asyncio.Future()
@@ -276,9 +277,11 @@ class TestoReader:
                 name = (payload[4:firstDataByte]).decode('utf-8')
                 # logger.info(f"Name: {name}")
                 value = struct.unpack("<f",payload[firstDataByte:firstDataByte+4])[0]
-                # logger.info(f"Value: {value}")
-                self.buffer[name] = value
-                self._maybe_report()
+                # Accumulate value for averaging
+                if name in self.sums:
+                    self.sums[name] += value
+                    self.counts[name] += 1
+                    self._maybe_report()
 
         except Exception as e:
             logger.error(f"handle_notify error: {e}")
@@ -289,7 +292,8 @@ class TestoReader:
         Publish only when both Temperature and Velocity are present.
         Also respect the configured sample_interval to avoid publishing too often.
         """
-        if self.buffer["Temperature"] is None or self.buffer["Velocity"] is None:
+        # Require at least one sample for each metric
+        if self.counts["Temperature"] == 0 or self.counts["Velocity"] == 0:
             return
 
         now = time.time()
@@ -297,14 +301,20 @@ class TestoReader:
         if now - self.last_pub < interval:
             return
 
-        self.last_pub = now
-        temp = self.buffer["Temperature"]
-        vel = self.buffer["Velocity"]
+        # Compute averages
+        temp = self.sums["Temperature"] / self.counts["Temperature"]
+        vel = self.sums["Velocity"] / self.counts["Velocity"]
 
-        logger.debug(f"Measurements: Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
+        # Reset accumulators for next averaging window
+        self.sums = {"Temperature": 0.0, "Velocity": 0.0}
+        self.counts = {"Temperature": 0, "Velocity": 0}
+
+        self.last_pub = now
+
+        logger.debug(f"Measurements (avg): Temperature: {temp:6.3f}, Velocity: {vel:6.3f}")
 
         if self.mqtt:
-            mqtt_publish(self.mqtt, self.cfg["mqtt"], self.buffer, self.serial_number)
+            mqtt_publish(self.mqtt, self.cfg["mqtt"], {"Temperature": temp, "Velocity": vel}, self.serial_number)
 
         if self.csv_logger:
             self.csv_logger.append(temp, vel)
@@ -314,6 +324,7 @@ async def connect_and_run(cfg):
     ble_cfg = cfg.get("ble_device", {})
     name_filter = [n.lower() for n in ble_cfg.get("name_filter", [])]
     addr = ble_cfg.get("address", "")
+    adapter = ble_cfg.get("adapter", "0")  # Default to hci0, but allow override in config
 
     device_name = None
 
@@ -375,7 +386,7 @@ async def connect_and_run(cfg):
 
     while not stop_event.is_set():
         try:
-            async with BleakClient(addr) as client:
+            async with BleakClient(addr, adapter=adapter) as client:
                 if not client.is_connected:
                     await client.connect()
 
