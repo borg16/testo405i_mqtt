@@ -171,7 +171,7 @@ def mqtt_connect(cfg: dict):
         return None
 
     try:
-        client = mqtt.Client()
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         
         # Set authentication if provided
         if cfg.get("username"):
@@ -199,8 +199,17 @@ def mqtt_connect(cfg: dict):
         logger.info(f"Connected to MQTT broker {host}:{port}{tls_str}")
         return client
 
+    except ssl.SSLError as e:
+        logger.error(f"MQTT SSL error: {e}. Check your TLS/SSL certificates and configuration.")
+        return None
+    except socket.error as e:
+        logger.error(f"MQTT network error: {e}. Check your network connectivity and broker address.")
+        return None
+    except mqtt.MQTTException as e:
+        logger.error(f"MQTT library error: {e}. Check your MQTT client configuration.")
+        return None
     except Exception as e:
-        logger.error(f"MQTT connection error: {e}")
+        logger.error(f"Unexpected MQTT connection error: {e}")
         return None
 
 
@@ -376,12 +385,12 @@ class TestoReader:
         self.latestAnswerFuture = asyncio.Future()
         return result
 
-    def handle_notify(self, sender, data: bytearray):
+    def handle_notify(self, characteristic, data: bytearray):
         """
         Handle BLE notification from Testo 405i device.
-        
+
         Args:
-            sender: BLE characteristic that sent the notification
+            characteristic: BleakGATTCharacteristic that sent the notification
             data: Raw data bytes from device
         """
         try:
@@ -389,7 +398,7 @@ class TestoReader:
             if self.incompleteAnswer:
                 data = self.incompleteAnswer + data
                 self.incompleteAnswer = b""
-            
+
             # Check if we have complete packet
             length = data[2]
             if length + 3 > len(data):
@@ -406,7 +415,7 @@ class TestoReader:
 
             # Extract payload
             payload = data[8:8+length]
-            
+
             # Handle command acknowledgment
             if data.startswith(b'\x07\x00'):
                 if length > 0:
@@ -422,14 +431,15 @@ class TestoReader:
             # Verify payload CRC
             crc = calc_crc16_modbus(payload)
             if crc != 0:
-                logger.warning("CRC mismatch in payload.")
-            
+                logger.warning("CRC mismatch in payload - dropping data.")
+                return
+
             # Handle measurement data
             if data.startswith(b'\x10\x80'):
                 first_data_byte = 4 + payload[0]
                 name = payload[4:first_data_byte].decode('utf-8')
                 value = struct.unpack("<f", payload[first_data_byte:first_data_byte+4])[0]
-                
+
                 # Accumulate value for averaging
                 if name in self.sums:
                     self.sums[name] += value
@@ -437,7 +447,7 @@ class TestoReader:
                     self._maybe_report()
 
         except Exception as e:
-            logger.error(f"handle_notify error: {e}")
+            logger.error(f"Unexpected notify {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
 
     def _maybe_report(self):
         """
@@ -604,9 +614,12 @@ async def connect_and_run(cfg: dict):
     # Main connection loop with reconnection on errors
     while not stop_event.is_set():
         try:
-            async with BleakClient(addr, adapter=adapter) as client:
-                if not client.is_connected:
-                    await client.connect()
+            # Increase timeout for BlueZ 5.82+ compatibility
+            async with BleakClient(
+                addr, 
+                adapter=adapter,
+                timeout=30.0  # Longer timeout for connection establishment
+            ) as client:
 
                 # Determine serial number
                 serial_from_name = extract_serial_from_text(device_name)
@@ -622,7 +635,9 @@ async def connect_and_run(cfg: dict):
                 if serial_number:
                     logger.info(f"Device serial number: {serial_number}")
                 else:
-                    logger.info("Serial number not determined")
+                    logger.error("Serial number not determined - cannot identify device. Reconnecting...")
+                    await asyncio.sleep(5)
+                    continue
 
                 logger.info(f"Connected to BLE device {addr}")
                 
@@ -644,15 +659,44 @@ async def connect_and_run(cfg: dict):
 
                 logger.info("Started receiving data. Press Ctrl+C to stop.")
 
-                # Keep connection alive
+                # Keep connection alive with aggressive periodic activity
+                # BlueZ 5.82+ has stricter supervision timeout enforcement
+                last_keepalive = time.time()
+                keepalive_interval = 30.0  # Aggressive 5-second keep-alive for new BlueZ
+                keepalive_counter = 0
+                
                 while client.is_connected and not stop_event.is_set():
                     await asyncio.sleep(0.5)
+                    
+                    # Perform periodic activity to maintain connection
+                    now = time.time()
+                    if now - last_keepalive >= keepalive_interval:
+                        try:
+                            # Alternate between reading characteristics to maintain traffic
+                            if keepalive_counter % 2 == 0:
+                                # Read serial number
+                                await client.read_gatt_char(UUID_SERIAL)
+                            else:
+                                # Re-subscribe to notifications (no-op if already subscribed)
+                                # This generates connection activity without disrupting data
+                                await client.start_notify(UUID_NOTIFY, reader.handle_notify)
+                            
+                            logger.debug(f"Keep-alive activity {keepalive_counter}")
+                            last_keepalive = now
+                            keepalive_counter += 1
+                        except Exception as e:
+                            logger.warning(f"Keep-alive failed: {type(e).__name__}")
+                            # Connection likely dead, let main loop detect it
+                
+                if not client.is_connected:
+                    logger.warning("BLE device disconnected. Reconnecting in 5s...")
+                    await asyncio.sleep(5)
 
         except BleakError as e:
             logger.warning(f"BLE error: {e}. Retrying in 5 seconds.")
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"Unexpected {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
             await asyncio.sleep(5)
 
     # Cleanup
